@@ -18,3 +18,4 @@ sha256sum ./wezterm-20240203-110809-5046fc22-src.tar.gz
 missing:
 
 fix noway and compare [1](./notes.md#L56)
+-> noway 77s, mspc with 8 chunks 47s

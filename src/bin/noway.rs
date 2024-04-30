@@ -1,8 +1,9 @@
 use std::{borrow::Borrow, path::PathBuf};
 
 use clap::Parser;
+use futures::StreamExt;
 use reqwest::Client;
-use tokio::fs::File;
+use tokio::{fs::File, io::AsyncWriteExt, time::Instant};
 use tokio_util::bytes::BufMut;
 use tracing::{
     debug,
@@ -82,46 +83,17 @@ async fn main() -> DResult<()> {
 
     debug!("ranges:\n{:?}", ranges);
 
-    let file_path = {
-        let mut p = PathBuf::from(c.path);
-        if p.is_dir() {
-            p.push(
-                hdr.url()
-                    .path_segments()
-                    .expect("Failed getting path segments from url")
-                    // .inspect(|x| debug!("url segments: {:?}", x))
-                    .last()
-                    .inspect(|x| debug!("url last segment: {:?}", x))
-                    .expect("Failed getting file name from url")
-                    .to_owned(),
-            );
-            p
-        } else {
-            if p.is_file() {
-                warn!("File already exists? will overwrite??!");
-                p
-            } else {
-                p
-            }
-        }
-    };
+    let file_path = get_file_path(&c);
 
     debug!("Parsed target file path as:\n {:?}", file_path);
 
-    let file = File::options()
-        .read(true)
-        .write(true)
-        .create(true)
-        .open(&file_path)
-        .await
-        .unwrap();
-
-    file.set_len(size).await?;
+    download_files(c.url.as_str(), &file_path).await?;
 
     Ok(())
 }
 
-async fn download_files(url: &str, path: &str) -> Result<()> {
+async fn download_files(url: &str, path: &PathBuf) -> Result<(), Errors> {
+    let start_time = Instant::now();
     let mut file = File::create(path).await?;
     println!("Downloading {}...", url);
 
@@ -134,9 +106,36 @@ async fn download_files(url: &str, path: &str) -> Result<()> {
 
     file.flush().await?;
 
-    println!("Downloaded {}", url);
+    println!("Downloaded in {:?}", start_time.elapsed());
     Ok(())
 }
+
+fn get_file_path(c:&Cli) -> PathBuf{
+    let mut p = PathBuf::from(c.path.to_owned());
+    let filename = match &c.url.rsplit_once("/") {
+        None => "download.bin",
+        Some((s1, s2)) => s2,
+    };
+    debug!("filename: {}", filename);
+    if p.is_dir() {
+        p.push(filename);
+        if p.is_file() {
+            warn!("File already exists? will overwrite??!");
+            p
+        } else {
+            p
+        }
+    } else {
+        debug!("p: {:?}", p);
+        if p.is_file() {
+            warn!("File already exists? will overwrite??!");
+            p
+        } else {
+            p
+        }
+    }
+}
+
 
 #[derive(Debug)]
 enum Errors {

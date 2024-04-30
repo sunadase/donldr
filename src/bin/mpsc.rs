@@ -120,31 +120,7 @@ async fn main() -> DResult<()> {
 }
 
 async fn file_manager(mut rx: Receiver<Chunk>, c: Cli, size:u64, start_time: Instant) {
-    let file_path = {
-        let mut p = PathBuf::from(c.path);
-        let filename = match &c.url.rsplit_once("/") {
-            None => "download.bin",
-            Some((s1, s2)) => s2,
-        };
-        debug!("filename: {}", filename);
-        if p.is_dir() {
-            p.push(filename);
-            if p.is_file() {
-                warn!("File already exists? will overwrite??!");
-                p
-            } else {
-                p
-            }
-        } else {
-            debug!("p: {:?}", p);
-            if p.is_file() {
-                warn!("File already exists? will overwrite??!");
-                p
-            } else {
-                p
-            }
-        }
-    };
+    let file_path = get_file_path(&c);
 
     debug!("Parsed target file path as:\n {:?}", file_path);
 
@@ -193,6 +169,31 @@ async fn file_manager(mut rx: Receiver<Chunk>, c: Cli, size:u64, start_time: Ins
     }    
 }
 
+fn get_file_path(c:&Cli) -> PathBuf{
+    let mut p = PathBuf::from(c.path.to_owned());
+    let filename = match &c.url.rsplit_once("/") {
+        None => "download.bin",
+        Some((s1, s2)) => s2,
+    };
+    debug!("filename: {}", filename);
+    if p.is_dir() {
+        p.push(filename);
+        if p.is_file() {
+            warn!("File already exists? will overwrite??!");
+            p
+        } else {
+            p
+        }
+    } else {
+        debug!("p: {:?}", p);
+        if p.is_file() {
+            warn!("File already exists? will overwrite??!");
+            p
+        } else {
+            p
+        }
+    }
+}
 
 #[derive(Debug)]
 enum Chunk {
