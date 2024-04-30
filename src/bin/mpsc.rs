@@ -6,7 +6,7 @@ use reqwest::Client;
 use tokio::{
     fs::File,
     io::{AsyncSeekExt, AsyncWriteExt},
-    sync::mpsc::Sender,
+    sync::mpsc::{Receiver, Sender},
     task::JoinHandle,
     time::Instant,
 };
@@ -41,7 +41,7 @@ async fn main() -> DResult<()> {
     #[cfg(debug_assertions)]
     let tracing_level = tracing::Level::DEBUG;
     #[cfg(not(debug_assertions))]
-    let tracing_level = tracing::Level::ERROR;
+    let tracing_level = tracing::Level::WARN;
     let subcriber = tracing_subscriber::fmt()
         .compact()
         .with_line_number(true)
@@ -72,11 +72,15 @@ async fn main() -> DResult<()> {
     //? if chunks>size?
     debug!("chunk size: {}", chunk_size);
 
-    let accept_ranges = hdr
-        .headers()
-        .get("accept-ranges")
-        .expect("Can't find accept ranges");
-    debug!("accept ranges: {:?}", accept_ranges);
+    if let Some(accept_ranges) = hdr
+    .headers()
+    .get("accept-ranges"){
+        debug!("accept ranges: {:?}", accept_ranges);
+        assert_ne!(accept_ranges, "none", "")
+    } else {
+        warn!("Couldn't find accept-ranges, still trying..")
+    }
+        
 
     let mut ranges = (0..size)
         .step_by(chunk_size as usize)
@@ -106,73 +110,7 @@ async fn main() -> DResult<()> {
         )))
     }
 
-    let file_manager = tokio::spawn(async move {
-        let file_path = {
-            let mut p = PathBuf::from(c.path);
-            let filename = match &c.url.rsplit_once("/") {
-                None => "download.bin",
-                Some((s1, s2)) => s2,
-            };
-            debug!("filename: {}", filename);
-            if p.is_dir() {
-                p.push(filename);
-                p
-            } else {
-                if p.is_file() {
-                    warn!("File already exists? will overwrite??!");
-                    p
-                } else {
-                    p
-                }
-            }
-        };
-
-        debug!("Parsed target file path as:\n {:?}", file_path);
-
-        let mut file = File::options()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(&file_path)
-            .await
-            .unwrap();
-
-        file.set_len(size)
-            .await
-            .expect("Failed setting file length?");
-
-        let mut finished_chunks = Status::new(c.chunks.into());
-        //[1|2|3|4|5|6]
-        //[x¹|x²|x³|✓¹|x¹|x¹]
-        while let Some(cmd) = rx.recv().await {
-            match cmd {
-                Chunk::Downloaded {
-                    index,
-                    offset,
-                    bytes,
-                } => {
-                    debug!(
-                        "Recieved file parts: [{}] [{}->{}",
-                        index,
-                        offset,
-                        bytes.len()
-                    );
-                    file.seek(std::io::SeekFrom::Start(offset))
-                        .await
-                        .expect("Failed seeking into file offset");
-                    file.write_all(&bytes).await.expect("File write_all failed");
-                    debug!("written chunk [{}]", index);
-                    finished_chunks.push(index);
-                }
-            }
-            println!("{}", finished_chunks);
-            if finished_chunks.check() {
-                let duration = start_time.elapsed();
-                println!("Download finished in {:?}", duration);
-                break;
-            }
-        }
-    });
+    let file_manager = tokio::spawn(file_manager(rx, c, size, start_time));
 
     for task in downloaders {
         task.await.map_err(|x| error!("{}", x)).unwrap();
@@ -180,6 +118,81 @@ async fn main() -> DResult<()> {
     file_manager.await.map_err(|x| error!("{}", x)).unwrap();
     Ok(())
 }
+
+async fn file_manager(mut rx: Receiver<Chunk>, c: Cli, size:u64, start_time: Instant) {
+    let file_path = {
+        let mut p = PathBuf::from(c.path);
+        let filename = match &c.url.rsplit_once("/") {
+            None => "download.bin",
+            Some((s1, s2)) => s2,
+        };
+        debug!("filename: {}", filename);
+        if p.is_dir() {
+            p.push(filename);
+            if p.is_file() {
+                warn!("File already exists? will overwrite??!");
+                p
+            } else {
+                p
+            }
+        } else {
+            debug!("p: {:?}", p);
+            if p.is_file() {
+                warn!("File already exists? will overwrite??!");
+                p
+            } else {
+                p
+            }
+        }
+    };
+
+    debug!("Parsed target file path as:\n {:?}", file_path);
+
+    let mut file = File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&file_path)
+        .await
+        .expect("Failed opening file");
+
+    file.set_len(size)
+        .await
+        .expect("Failed setting file length?");
+
+    let mut finished_chunks = Status::new(c.chunks.into());
+    //[1|2|3|4|5|6]
+    //[x¹|x²|x³|✓¹|x¹|x¹]
+    while let Some(cmd) = rx.recv().await {
+        match cmd {
+            Chunk::Downloaded {
+                index,
+                offset,
+                bytes,
+            } => {
+                debug!(
+                    "Recieved file parts: [{}] [{}->{}",
+                    index,
+                    offset,
+                    bytes.len()
+                );
+                file.seek(std::io::SeekFrom::Start(offset))
+                    .await
+                    .expect("Failed seeking into file offset");
+                file.write_all(&bytes).await.expect("File write_all failed");
+                debug!("written chunk [{}]", index);
+                finished_chunks.push(index);
+            }
+        }
+        println!("{}", finished_chunks);
+        if finished_chunks.check() {
+            let duration = start_time.elapsed();
+            println!("Download finished in {:?}", duration);
+            break;
+        }
+    }    
+}
+
 
 #[derive(Debug)]
 enum Chunk {
@@ -202,19 +215,25 @@ impl Status {
             chunks: HashSet::new(),
         }
     }
+    #[inline]
     fn push(&mut self, chunk: usize) {
         self.chunks.insert(chunk);
     }
+    #[inline]
     fn check_len(&self) -> bool {
         self.chunks.len() == self.total_chunks
     }
     fn check(&self) -> bool {
-        for c in 0..self.total_chunks {
-            if !self.chunks.contains(&c) {
-                return false;
+        if self.check_len(){
+            for c in 0..self.total_chunks {
+                if !self.chunks.contains(&c) {
+                    return false;
+                }
             }
+            true
+        } else {
+            false
         }
-        true
     }
 }
 
@@ -246,13 +265,16 @@ impl std::fmt::Display for Status {
 const supe: [char; 10] = ['⁰', '¹', '²', '³', '⁴', '⁵', '⁶', '⁷', '⁸', '⁹'];
 fn superscript(mut n: usize) -> String {
     let mut s: String = String::new();
-    while n > 0 {
-        s.push(supe[n % 10]);
-        n = n / 10;
-    }
-    s.chars().rev().collect()
-}
+    if n == 0 { s.push(supe[0]); s }
+    else {
+        while n > 0 {
+            s.push(supe[n % 10]);
+            n = n / 10;
+        }
+        s.chars().rev().collect()
 
+    }
+}
 async fn get_chunk(
     client: Client,
     tx: Sender<Chunk>,
