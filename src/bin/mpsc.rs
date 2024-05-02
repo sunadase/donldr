@@ -33,17 +33,7 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> DResult<()> {
-    #[cfg(debug_assertions)]
-    let tracing_level = tracing::Level::DEBUG;
-    #[cfg(not(debug_assertions))]
-    let tracing_level = tracing::Level::WARN;
-    let subcriber = tracing_subscriber::fmt()
-        .compact()
-        .with_line_number(true)
-        .with_thread_ids(true)
-        .with_max_level(tracing_level)
-        .finish();
-    subscriber::set_global_default(subcriber)?;
+    donldr::set_tracing()?;
 
     let c = Cli::parse();
     debug!("parsed cli:\n{:#?}", c);
