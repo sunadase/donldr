@@ -1,6 +1,7 @@
 use std::{borrow::Borrow, path::PathBuf};
 
 use clap::Parser;
+use donldr::{download::{self, determine_file_path, Download}, DResult};
 use reqwest::Client;
 use tokio::fs::File;
 use tokio_util::bytes::BufMut;
@@ -9,6 +10,7 @@ use tracing::{
     subscriber::{self, SetGlobalDefaultError},
     warn,
 };
+
 
 struct DownloadTask {
     url: String,
@@ -26,7 +28,7 @@ struct Cli {
     path: String,
     ///Chunks to divide the file into concurrent downloads
     #[arg(short, long, default_value_t = 8)]
-    chunks: u8,
+    chunks: usize,
 }
 
 #[tokio::main]
@@ -47,64 +49,10 @@ async fn main() -> DResult<()> {
 
     let c = Cli::parse();
     debug!("parsed cli:\n{:#?}", c);
-    let url = reqwest::Url::parse(&c.url).expect("Failed parsing url");
-    debug!("parsed url:\n{:#?}", &url);
+    let download = Download::new(c.url, c.path, c.chunks).await?;
+    drop(c);
 
-    let client = reqwest::Client::new();
-    let hdr = client.head(url.as_str()).send().await?;
-    debug!("headers at target url:\n{:#?}", hdr);
-
-    let size = hdr
-        .headers()
-        .get("content-length")
-        .expect("Failed to get content length")
-        .to_str()
-        .unwrap()
-        .parse::<u64>()
-        .expect("Failed parsing content-length");
-    debug!("size: {}", size);
-    let chunk_size = size / c.chunks as u64;
-    debug!("chunk size: {}", chunk_size);
-
-    let accept_ranges = hdr
-        .headers()
-        .get("accept-ranges")
-        .expect("Can't find accept ranges");
-    debug!("accept ranges: {:?}", accept_ranges);
-
-    let mut ranges = (0..size)
-        .step_by(chunk_size as usize)
-        .map(|from| (from, from + chunk_size - 1))
-        .collect::<Vec<_>>();
-    ranges.last_mut().expect("Failed getting last range").1 = size;
-
-    debug!("ranges:\n{:?}", ranges);
-
-    let file_path = {
-        let mut p = PathBuf::from(c.path);
-        if p.is_dir() {
-            p.push(
-                hdr.url()
-                    .path_segments()
-                    .expect("Failed getting path segments from url")
-                    // .inspect(|x| debug!("url segments: {:?}", x))
-                    .last()
-                    .inspect(|x| debug!("url last segment: {:?}", x))
-                    .expect("Failed getting file name from url")
-                    .to_owned(),
-            );
-            p
-        } else {
-            if p.is_file() {
-                warn!("File already exists? will overwrite??!");
-                p
-            } else {
-                p
-            }
-        }
-    };
-
-    debug!("Parsed target file path as:\n {:?}", file_path);
+    let file_path = determine_file_path(download.path, download.url);
 
     let file = File::options()
         .read(true)
@@ -114,15 +62,7 @@ async fn main() -> DResult<()> {
         .await
         .unwrap();
 
-    file.set_len(size).await?;
-
-    let test_part = client
-        .get(c.url)
-        .header("Range", format!("bytes={}-{}", ranges[0].0, ranges[0].1))
-        .send()
-        .await?;
-
-    debug!("test_part:\n{:?}", test_part);
+    file.set_len(download.info.size).await?;
 
     let mut mmap =
         unsafe { memmap2::MmapMut::map_mut(&file).expect("getting a mmap for file failed") };
@@ -180,28 +120,3 @@ async fn chunk_download_write(
 
     Ok(())
 }
-
-#[derive(Debug)]
-enum Errors {
-    Tracing(tracing::subscriber::SetGlobalDefaultError),
-    Io(std::io::Error),
-    Reqwest(reqwest::Error),
-}
-
-impl From<SetGlobalDefaultError> for Errors {
-    fn from(value: SetGlobalDefaultError) -> Self {
-        Errors::Tracing(value)
-    }
-}
-impl From<std::io::Error> for Errors {
-    fn from(value: std::io::Error) -> Self {
-        Errors::Io(value)
-    }
-}
-impl From<reqwest::Error> for Errors {
-    fn from(value: reqwest::Error) -> Self {
-        Errors::Reqwest(value)
-    }
-}
-
-type DResult<T> = Result<T, Errors>;

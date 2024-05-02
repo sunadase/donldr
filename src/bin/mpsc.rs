@@ -15,93 +15,7 @@ use tracing::{
     debug, error, info, subscriber::{self, SetGlobalDefaultError}, warn
 };
 
-struct Info {
-    headers: Response,
-    chunks: usize,
-
-    /// content-length
-    size: u64,
-    chunk_size: u64,
-    ranges: Vec<(u64,u64)>,
-}
-
-impl Info {
-    fn new(headers: Response, chunks: usize) -> Self {
-        let size = headers
-            .headers()
-            .get("content-length")
-            .expect("Failed to get content length")
-            .to_str()
-            .unwrap()
-            .parse::<u64>()
-            .expect("Failed parsing content-length");
-        debug!("size: {}", size);
-        let chunk_size = size / chunks as u64;
-        //? if chunks>size?
-        debug!("chunk size: {}", chunk_size);
-        let mut ranges = (0..size)
-        .step_by(chunk_size as usize)
-        .map(|from| (from, from + chunk_size - 1))
-        .collect::<Vec<_>>();
-        ranges.last_mut().expect("Failed getting last range").1 = size;
-        debug!("ranges:\n{:?}", ranges);
-
-        Info { headers, chunks, size, chunk_size, ranges }
-    }
-    fn check_accept_ranges(&self) -> bool {
-        match self.headers
-            .headers()
-            .get("accept-ranges").map(|x|x.to_str())
-        {
-            Some(Ok(accept_ranges)) => {
-                debug!("accept ranges: {:?}", accept_ranges);
-                match accept_ranges {
-                    "none" => { false },
-                    _ => { true }
-                } 
-            }
-            Some(Err(_)) => {
-                error!("Failed converting accept-ranges header to str. aborting");
-                false
-            }
-            None => {
-                warn!("Couldn't find accept-ranges, trying chunked download regardless..");
-                true
-            }
-
-        }
-    }
-}
-
-struct Download {
-    client: Client,
-    url: String,
-    path: String,
-    info: Info
-}
-
-impl Download {
-    async fn new<S: AsRef<str>>(url: S, path: S, chunks:usize) -> Result<Self, Errors> {
-        let url = reqwest::Url::parse(url.as_ref()).expect("Failed parsing url");
-        debug!("parsed url:\n{:#?}", &url);
-
-        let client = reqwest::Client::new();
-        if let Ok(headers) = client.head(url.as_str()).send().await {
-            debug!("headers at target url:\n{:#?}", headers);
-            let info = Info::new(headers, chunks);
-            Ok(Download {client, url: url.as_str().to_owned(), path: path.as_ref().to_owned(), info})
-        } else {
-            warn!("Failed getting headers");
-            Err("Failed getting headers".into())
-        }
-             
-    }
-
-    fn get_ranges(&self, idx: usize) -> (u64, u64) {
-        (self.info.ranges[idx as usize].0, self.info.ranges[idx as usize].1)
-    }
-}
-
+use donldr::{DResult,download::{Download, determine_file_path}, Errors};
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -131,12 +45,9 @@ async fn main() -> DResult<()> {
         .finish();
     subscriber::set_global_default(subcriber)?;
 
-    let download;
-    {
-        let c = Cli::parse();
-        debug!("parsed cli:\n{:#?}", c);
-        download = Download::new(c.url, c.path, c.chunks).await?;
-    }
+    let c = Cli::parse();
+    debug!("parsed cli:\n{:#?}", c);
+    let download = Download::new(c.url, c.path, c.chunks).await?;
 
     let (tx, mut rx) = tokio::sync::mpsc::channel((download.info.chunk_size * 4) as usize);
     let start_time = Instant::now();
@@ -167,7 +78,7 @@ async fn main() -> DResult<()> {
 }
 
 async fn file_manager(mut rx: Receiver<Chunk>, path: String, url: String, chunks: usize,  size:u64, start_time: Instant) {
-    let file_path = get_file_path(path, url);
+    let file_path = determine_file_path(path, url);
 
     debug!("Parsed target file path as:\n {:?}", file_path);
 
@@ -214,32 +125,6 @@ async fn file_manager(mut rx: Receiver<Chunk>, path: String, url: String, chunks
             break;
         }
     }    
-}
-
-fn get_file_path<S: AsRef<str>>(path: S, url: S) -> PathBuf{
-    let mut p = PathBuf::from(path.as_ref());
-    let filename = match url.as_ref().rsplit_once("/") {
-        None => "download.bin",
-        Some((s1, s2)) => s2,
-    };
-    debug!("filename: {}", filename);
-    if p.is_dir() {
-        p.push(filename);
-        if p.is_file() {
-            warn!("File already exists? will overwrite??!");
-            p
-        } else {
-            p
-        }
-    } else {
-        debug!("p: {:?}", p);
-        if p.is_file() {
-            warn!("File already exists? will overwrite??!");
-            p
-        } else {
-            p
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -360,33 +245,3 @@ async fn get_chunk(
     .expect("Failed sending chunk through channel");
 }
 
-#[derive(Debug)]
-enum Errors {
-    Tracing(tracing::subscriber::SetGlobalDefaultError),
-    Io(std::io::Error),
-    Reqwest(reqwest::Error),
-    Custom(String)
-}
-
-impl From<SetGlobalDefaultError> for Errors {
-    fn from(value: SetGlobalDefaultError) -> Self {
-        Errors::Tracing(value)
-    }
-}
-impl From<std::io::Error> for Errors {
-    fn from(value: std::io::Error) -> Self {
-        Errors::Io(value)
-    }
-}
-impl From<reqwest::Error> for Errors {
-    fn from(value: reqwest::Error) -> Self {
-        Errors::Reqwest(value)
-    }
-}
-impl From<&str> for Errors {
-    fn from(value: &str) -> Self {
-        Errors::Custom(value.to_owned())
-    }
-}
-
-type DResult<T> = Result<T, Errors>;
