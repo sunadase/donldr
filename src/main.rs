@@ -1,7 +1,7 @@
 use std::{borrow::Borrow, path::PathBuf};
 
 use clap::Parser;
-use donldr::{download::{self, determine_file_path, Download}, DResult};
+use donldr::{download::{self, determine_file_path, Download}, set_tracing, DResult};
 use reqwest::Client;
 use tokio::fs::File;
 use tokio_util::bytes::BufMut;
@@ -33,19 +33,7 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> DResult<()> {
-    println!("Hello, world!");
-
-    #[cfg(debug_assertions)]
-    let tracing_level = tracing::Level::DEBUG;
-    #[cfg(not(debug_assertions))]
-    let tracing_level = tracing::Level::ERROR;
-    let subcriber = tracing_subscriber::fmt()
-        .compact()
-        .with_line_number(true)
-        .with_thread_ids(true)
-        .with_max_level(tracing_level)
-        .finish();
-    subscriber::set_global_default(subcriber)?;
+    set_tracing()?;
 
     let c = Cli::parse();
     debug!("parsed cli:\n{:#?}", c);
