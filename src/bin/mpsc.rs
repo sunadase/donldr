@@ -1,8 +1,8 @@
-use std::{borrow::Borrow, collections::HashSet, fmt::write, path::PathBuf};
+use std::{borrow::Borrow, collections::HashSet, fmt::write, path::{self, PathBuf}};
 
-use clap::Parser;
+use clap::{builder::Str, Parser};
 use colored::Colorize;
-use reqwest::Client;
+use reqwest::{Client, Response, Url};
 use tokio::{
     fs::File,
     io::{AsyncSeekExt, AsyncWriteExt},
@@ -12,15 +12,96 @@ use tokio::{
 };
 use tokio_util::bytes::{BufMut, Bytes};
 use tracing::{
-    debug, error,
-    subscriber::{self, SetGlobalDefaultError},
-    warn,
+    debug, error, info, subscriber::{self, SetGlobalDefaultError}, warn
 };
 
-struct DownloadTask {
+struct Info {
+    headers: Response,
+    chunks: usize,
+
+    /// content-length
+    size: u64,
+    chunk_size: u64,
+    ranges: Vec<(u64,u64)>,
+}
+
+impl Info {
+    fn new(headers: Response, chunks: usize) -> Self {
+        let size = headers
+            .headers()
+            .get("content-length")
+            .expect("Failed to get content length")
+            .to_str()
+            .unwrap()
+            .parse::<u64>()
+            .expect("Failed parsing content-length");
+        debug!("size: {}", size);
+        let chunk_size = size / chunks as u64;
+        //? if chunks>size?
+        debug!("chunk size: {}", chunk_size);
+        let mut ranges = (0..size)
+        .step_by(chunk_size as usize)
+        .map(|from| (from, from + chunk_size - 1))
+        .collect::<Vec<_>>();
+        ranges.last_mut().expect("Failed getting last range").1 = size;
+        debug!("ranges:\n{:?}", ranges);
+
+        Info { headers, chunks, size, chunk_size, ranges }
+    }
+    fn check_accept_ranges(&self) -> bool {
+        match self.headers
+            .headers()
+            .get("accept-ranges").map(|x|x.to_str())
+        {
+            Some(Ok(accept_ranges)) => {
+                debug!("accept ranges: {:?}", accept_ranges);
+                match accept_ranges {
+                    "none" => { false },
+                    _ => { true }
+                } 
+            }
+            Some(Err(_)) => {
+                error!("Failed converting accept-ranges header to str. aborting");
+                false
+            }
+            None => {
+                warn!("Couldn't find accept-ranges, trying chunked download regardless..");
+                true
+            }
+
+        }
+    }
+}
+
+struct Download {
+    client: Client,
     url: String,
     path: String,
+    info: Info
 }
+
+impl Download {
+    async fn new<S: AsRef<str>>(url: S, path: S, chunks:usize) -> Result<Self, Errors> {
+        let url = reqwest::Url::parse(url.as_ref()).expect("Failed parsing url");
+        debug!("parsed url:\n{:#?}", &url);
+
+        let client = reqwest::Client::new();
+        if let Ok(headers) = client.head(url.as_str()).send().await {
+            debug!("headers at target url:\n{:#?}", headers);
+            let info = Info::new(headers, chunks);
+            Ok(Download {client, url: url.as_str().to_owned(), path: path.as_ref().to_owned(), info})
+        } else {
+            warn!("Failed getting headers");
+            Err("Failed getting headers".into())
+        }
+             
+    }
+
+    fn get_ranges(&self, idx: usize) -> (u64, u64) {
+        (self.info.ranges[idx as usize].0, self.info.ranges[idx as usize].1)
+    }
+}
+
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -33,7 +114,7 @@ struct Cli {
     path: String,
     ///Chunks to divide the file into concurrent downloads
     #[arg(short, long, default_value_t = 8)]
-    chunks: u8,
+    chunks: usize,
 }
 
 #[tokio::main]
@@ -50,55 +131,21 @@ async fn main() -> DResult<()> {
         .finish();
     subscriber::set_global_default(subcriber)?;
 
-    let c = Cli::parse();
-    debug!("parsed cli:\n{:#?}", c);
-    let url = reqwest::Url::parse(&c.url).expect("Failed parsing url");
-    debug!("parsed url:\n{:#?}", &url);
-
-    let client = reqwest::Client::new();
-    let hdr = client.head(url.as_str()).send().await?;
-    debug!("headers at target url:\n{:#?}", hdr);
-
-    let size = hdr
-        .headers()
-        .get("content-length")
-        .expect("Failed to get content length")
-        .to_str()
-        .unwrap()
-        .parse::<u64>()
-        .expect("Failed parsing content-length");
-    debug!("size: {}", size);
-    let chunk_size = size / c.chunks as u64;
-    //? if chunks>size?
-    debug!("chunk size: {}", chunk_size);
-
-    if let Some(accept_ranges) = hdr
-    .headers()
-    .get("accept-ranges"){
-        debug!("accept ranges: {:?}", accept_ranges);
-        assert_ne!(accept_ranges, "none", "")
-    } else {
-        warn!("Couldn't find accept-ranges, still trying..")
+    let download;
+    {
+        let c = Cli::parse();
+        debug!("parsed cli:\n{:#?}", c);
+        download = Download::new(c.url, c.path, c.chunks).await?;
     }
-        
 
-    let mut ranges = (0..size)
-        .step_by(chunk_size as usize)
-        .map(|from| (from, from + chunk_size - 1))
-        .collect::<Vec<_>>();
-    ranges.last_mut().expect("Failed getting last range").1 = size;
-
-    debug!("ranges:\n{:?}", ranges);
-
-    let (tx, mut rx) = tokio::sync::mpsc::channel((chunk_size * 4) as usize);
-
+    let (tx, mut rx) = tokio::sync::mpsc::channel((download.info.chunk_size * 4) as usize);
     let start_time = Instant::now();
     let mut downloaders: Vec<JoinHandle<()>> = vec![];
     //downloaders
-    for idx in 0..c.chunks {
-        let (from, to) = (ranges[idx as usize].0, ranges[idx as usize].1);
-        let client = client.clone();
-        let url = c.url.clone();
+    for idx in 0..download.info.chunks {
+        let (from, to) = download.get_ranges(idx);
+        let client = download.client.clone();
+        let url = download.url.clone();
         let tx = tx.clone();
         downloaders.push(tokio::spawn(get_chunk(
             client,
@@ -110,7 +157,7 @@ async fn main() -> DResult<()> {
         )))
     }
 
-    let file_manager = tokio::spawn(file_manager(rx, c, size, start_time));
+    let file_manager = tokio::spawn(file_manager(rx, download.path, download.url, download.info.chunks, download.info.size, start_time));
 
     for task in downloaders {
         task.await.map_err(|x| error!("{}", x)).unwrap();
@@ -119,8 +166,8 @@ async fn main() -> DResult<()> {
     Ok(())
 }
 
-async fn file_manager(mut rx: Receiver<Chunk>, c: Cli, size:u64, start_time: Instant) {
-    let file_path = get_file_path(&c);
+async fn file_manager(mut rx: Receiver<Chunk>, path: String, url: String, chunks: usize,  size:u64, start_time: Instant) {
+    let file_path = get_file_path(path, url);
 
     debug!("Parsed target file path as:\n {:?}", file_path);
 
@@ -136,7 +183,7 @@ async fn file_manager(mut rx: Receiver<Chunk>, c: Cli, size:u64, start_time: Ins
         .await
         .expect("Failed setting file length?");
 
-    let mut finished_chunks = Status::new(c.chunks.into());
+    let mut finished_chunks = Status::new(chunks);
     //[1|2|3|4|5|6]
     //[x¹|x²|x³|✓¹|x¹|x¹]
     while let Some(cmd) = rx.recv().await {
@@ -169,9 +216,9 @@ async fn file_manager(mut rx: Receiver<Chunk>, c: Cli, size:u64, start_time: Ins
     }    
 }
 
-fn get_file_path(c:&Cli) -> PathBuf{
-    let mut p = PathBuf::from(c.path.to_owned());
-    let filename = match &c.url.rsplit_once("/") {
+fn get_file_path<S: AsRef<str>>(path: S, url: S) -> PathBuf{
+    let mut p = PathBuf::from(path.as_ref());
+    let filename = match url.as_ref().rsplit_once("/") {
         None => "download.bin",
         Some((s1, s2)) => s2,
     };
@@ -318,6 +365,7 @@ enum Errors {
     Tracing(tracing::subscriber::SetGlobalDefaultError),
     Io(std::io::Error),
     Reqwest(reqwest::Error),
+    Custom(String)
 }
 
 impl From<SetGlobalDefaultError> for Errors {
@@ -333,6 +381,11 @@ impl From<std::io::Error> for Errors {
 impl From<reqwest::Error> for Errors {
     fn from(value: reqwest::Error) -> Self {
         Errors::Reqwest(value)
+    }
+}
+impl From<&str> for Errors {
+    fn from(value: &str) -> Self {
+        Errors::Custom(value.to_owned())
     }
 }
 
