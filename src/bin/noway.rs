@@ -40,12 +40,15 @@ async fn main() -> DResult<()> {
     let c = Cli::parse();
     debug!("parsed cli:\n{:#?}", c);
     let download = Download::new(c.url, c.path, c.chunks).await?;
+    warn!("This version isn't chunked but async streamed.");
+    warn!("So chunk val does nothing.");
 
     let file_path = determine_file_path(&download.path, &download.url);
 
     debug!("Parsed target file path as:\n {:?}", file_path);
 
     download_files(&download.url, &file_path).await?;
+
 
     Ok(())
 }
