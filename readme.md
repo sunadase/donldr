@@ -74,7 +74,7 @@ www.web.com/data.zip
                RESP │     RESP │     RESP │     RESP │     RESP │  
                 │  GET     │  GET     │  GET     │  GET     │  GET: Range: bytes=c4-c5
                 v   │      v   │      v   │      v   │      v   │ 
-            ┌───────┴─┐┌───────┴─┐┌───────┴─┐┌───────┴─┐┌───────┴─┐ 
+tasks:      ┌───────┴─┐┌───────┴─┐┌───────┴─┐┌───────┴─┐┌───────┴─┐ 
             │  down1  ││  down2  ││  down3  ││  down4  ││  down5  │
             │         ││         ││         ││         ││         │
             │async GET││         ││         ││         ││         │
@@ -97,7 +97,7 @@ mmap        v          v          v          v          v
 ```
 
 
-io_uring scheme(i think):
+io_uring scheme(i think??):
 ```
 www.web.com/data.zip
             ┌─────────┐┌─────────┐┌─────────┐┌─────────┐┌─────────┐
