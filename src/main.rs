@@ -84,9 +84,9 @@ async fn main() -> DResult<()> {
                     }
                 }
             };
-            debug!("Finished downloading chunk {}, len:{}", idx, response.len());
+            debug!("Finished downloading chunk {}, len:{}, [{from}-{to}]: {}", idx, response.len(), (to-from+1));
             
-            chunk.copy_fill_from(response.as_ptr());
+            chunk.copy_fill(response.as_ptr(), std::cmp::min(chunk.len, response.len()));
             debug!("Finished writing chunk {}, len:{}", idx, chunk.len);
             // chunk.write_all(response.as_ref());
             drop(chunk);
@@ -148,6 +148,11 @@ impl Memory {
 
     fn copy_fill_from(&mut self, src: *const u8) {
         unsafe { self.inner.copy_from(src, self.len); }
+    }
+
+    fn copy_fill(&mut self, src: *const u8, len:usize) {
+        assert!(len<= self.len, "Can't give a length larger than allocated memory length");
+        unsafe { self.inner.copy_from(src, len)}
     }
 }
 
