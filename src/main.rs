@@ -2,7 +2,7 @@ use std::{
     borrow::Borrow,
     io::{Read, Write},
     path::PathBuf,
-    ptr,
+    ptr, sync::atomic::AtomicUsize,
 };
 
 use clap::Parser;
@@ -11,7 +11,7 @@ use donldr::{
     set_tracing, DResult,
 };
 use futures::{stream, FutureExt, StreamExt, TryFutureExt};
-use reqwest::Client;
+use reqwest::{Client, Error};
 use tokio::{
     fs::File,
     task::{JoinHandle, JoinSet},
@@ -67,113 +67,62 @@ async fn main() -> DResult<()> {
         unsafe { memmap2::MmapMut::map_mut(&file).expect("getting a mmap for file failed") };
 
     // let mut downloaders: Vec<JoinHandle<()>> = vec![];
-    let mut downloaders = JoinSet::new();
+    let mut downloaders: JoinSet<Result<usize, Error>> = JoinSet::new();
 
     let start_time = Instant::now();
-
-    // let stream_of_requests = stream::iter((0..download.info.chunks).map(|idx| {
-    //     let (from, to) = download.get_ranges(idx as usize);
-    //     let req =
-    //     download
-    //         .client
-    //         .get(&download.url)
-    //         .header("Range", format!("bytes={}-{}", from, to))
-    //         .send();
-    //     req
-    //         .then(|x| x.expect("Failed getting request").bytes())
-    //         .map_err(|e| (e, req.))
-    //         .map(move |x| (idx, x))
-    // }));
-    // let mut buffer = stream_of_requests.buffer_unordered(download.info.chunks);
-
-    // let mut map_write = JoinSet::new();
-    // while let Some((idx, response)) = buffer.next().await {
-    //     match response {
-    //         Ok(res) => {
-    //             let (from, to) = download.get_ranges(idx as usize);
-    //             let len = (to - from + 1) as usize;
-    //             let mut chunk =
-    //             Memory::new(unsafe { mmap.as_mut_ptr().add(from as usize) }, len);
-    //             debug!(
-    //                 "Finished downloading chunk {}, len:{}, [{from}-{to}]: {}",
-    //                 idx,
-    //                 res.len(),
-    //                 (to - from + 1)
-    //             );
-    //             map_write.spawn(async move {
-    //                 chunk.copy_fill(res.as_ptr(), std::cmp::min(chunk.len, res.len()));
-    //                 debug!("Finished writing chunk {}, len:{}", idx, chunk.len);
-    //                 idx
-    //             });
-    //         }
-    //         Err((err, req)) => {
-    //                 //Request failed how to retry?
-    //                 error!("Response to bytes failed: {}", err);
-    //                 // Err(idx)
-    //                 // buffer.
-    //         }
-    //     }
-    // }
-    
-
-    for idx in 0..download.info.chunks {
-        let client = download.client.clone();
-        let url = download.url.clone();
+    let stream_of_requests = stream::iter((0..download.info.chunks).map(|idx| {
         let (from, to) = download.get_ranges(idx as usize);
-        debug!("range: [{from}-{to}]");
-        let len = (to - from + 1) as usize;
-        debug!("len  : {len}");
-        let mut chunk = Memory::new(unsafe { mmap.as_mut_ptr().add(from as usize) }, len);
-        // let mut chunk = mmap.get_mut(from as usize..=to as usize).expect("Slicing mmap failed");
+        let req =
+        download
+            .client
+            .get(&download.url)
+            .header("Range", format!("bytes={}-{}", from, to))
+            .send();
+        req
+            .map(move |x| (idx, x))
+    }));
+    let mut buffer = stream_of_requests.buffer_unordered(download.info.chunks);
 
-        downloaders.spawn(async move {
-            let response = loop {
-                let request = client
-                    .get(&url)
-                    .header("Range", format!("bytes={}-{}", from, to));
-                match request.send().await {
-                    Err(e) => {
-                        debug!("Chunk request failed with {}, retrying", e);
-                    }
-                    Ok(o) => {
-                        debug!("Got response: {:?}", o.headers());
-                        match o.bytes().await {
-                            Ok(b) => break b,
-                            Err(e) => {
-                                debug!("Failed retrieving bytes from response body? {}", e)
-                            }
-                        }
-                    }
-                }
-            };
-            debug!(
-                "Finished downloading chunk {}, len:{}, [{from}-{to}]: {}",
-                idx,
-                response.len(),
-                (to - from + 1)
-            );
+    while let Some((idx, response)) = buffer.next().await {
+        match response {
+            Ok(res) => {
+                let (from, to) = download.get_ranges(idx as usize);
+                let len = (to - from + 1) as usize;
+                let mut chunk =
+                Memory::new(unsafe { mmap.as_mut_ptr().add(from as usize) }, len);
+                let mut stream = res.bytes_stream();
+                downloaders.spawn(async move {
+                    let mut written = 0;
+                    while let Some(chunk_result) = stream.next().await {
+                        let respchunk = chunk_result?;
+                        
+                        debug!("strmd chunk size: {}", respchunk.len());
+                        chunk.write_at(written, respchunk.as_ptr(), std::cmp::min(respchunk.len(), chunk.len-written));
+                        written += respchunk.len();
+                        let perc = written as f32 / len as f32;
+                        // debug!("{}/{} : {:>3}",written, len, perc);
 
-            chunk.copy_fill(response.as_ptr(), std::cmp::min(chunk.len, response.len()));
-            debug!("Finished writing chunk {}, len:{}", idx, chunk.len);
-            // chunk.write_all(response.as_ref());
-            drop(chunk);
-            idx
-        });
+                    }
+                    Ok(idx)
+                });
+            }
+            Err((err)) => {
+                    //Request failed how to retry?
+                    error!("Send failed: {}", err);
+                    // Err(idx)
+                    // buffer.
+            }
+        }
     }
-    let mut seen: Vec<bool> = vec![false; download.info.chunks];
-    while let Some(res) = downloaders.join_next().await {
+
+    let mut seen = vec![false; download.info.chunks];
+    while let Some(Ok(res)) = downloaders.join_next().await {
         let idx = res.unwrap();
         seen[idx] = true;
         let sc = seen.iter().filter(|&x| *x==true).count();
         let perc = (sc as f32 / download.info.chunks as f32) * 100.;
         info!("{}/{}, {:>3}%", sc, download.info.chunks, perc)
     }
-    // while let Some(res) = map_write.join_next().await {
-    //     let idx = res.unwrap();
-    //     seen[idx] = true;
-    //     let perc = (seen.iter().count() / download.info.chunks) as f32 * 100.;
-    //     info!("{}/{}, {:>3}%", seen.iter().count(), download.info.chunks, perc)
-    // }
 
     debug!("Mem download finished in {:?}", start_time.elapsed());
     debug!("all tasks finished and returned");
@@ -196,6 +145,7 @@ async fn main() -> DResult<()> {
 struct Memory {
     inner: *mut u8,
     len: usize,
+    cursor: usize,
 }
 
 impl Memory {
@@ -203,7 +153,7 @@ impl Memory {
     /// This type assumes it's a mmap memory region
     /// with required permissions, and a valid len.
     fn new(ptr: *mut u8, len: usize) -> Self {
-        Memory { inner: ptr, len }
+        Memory { inner: ptr, len , cursor: 0}
     }
 
     ///SAFETY:
@@ -233,6 +183,15 @@ impl Memory {
             "Can't give a length larger than allocated memory length"
         );
         unsafe { self.inner.copy_from(src, len) }
+    }
+    
+
+    fn write_at(&mut self, offset: usize, src:*const u8, len: usize) {
+        assert!(
+            offset+len <= self.len,
+            "Writes out of bounds, offset+len can't be larger than self.len"
+        );
+        unsafe { self.inner.add(offset).copy_from(src, len)}
     }
 }
 
