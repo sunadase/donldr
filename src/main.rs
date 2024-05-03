@@ -173,8 +173,8 @@ impl Memory {
     /// with required permissions.
     /// If the src to be copied from has length
     /// less than self.len this function will try
-    /// to access it will try to access beyond
-    /// src's length: SIGSEGV ADDRESS BOUNDARY ERROR
+    /// to access beyond it's length:
+    ///     SIGSEGV ADDRESS BOUNDARY ERROR
     /// consider using: 
     ///     copy_fill with min(self.len, src.len)
     fn copy_fill_from(&mut self, src: *const u8) {
