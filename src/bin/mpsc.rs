@@ -1,4 +1,9 @@
-use std::{borrow::Borrow, collections::HashSet, fmt::write, path::{self, PathBuf}};
+use std::{
+    borrow::Borrow,
+    collections::HashSet,
+    fmt::write,
+    path::{self, PathBuf},
+};
 
 use clap::{builder::Str, Parser};
 use colored::Colorize;
@@ -12,10 +17,15 @@ use tokio::{
 };
 use tokio_util::bytes::{BufMut, Bytes};
 use tracing::{
-    debug, error, info, subscriber::{self, SetGlobalDefaultError}, warn
+    debug, error, info,
+    subscriber::{self, SetGlobalDefaultError},
+    warn,
 };
 
-use donldr::{DResult,download::{Download, determine_file_path}, Errors};
+use donldr::{
+    download::{determine_file_path, Download},
+    DResult, Errors,
+};
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -58,7 +68,14 @@ async fn main() -> DResult<()> {
         )))
     }
 
-    let file_manager = tokio::spawn(file_manager(rx, download.path, download.url, download.info.chunks, download.info.size, start_time));
+    let file_manager = tokio::spawn(file_manager(
+        rx,
+        download.path,
+        download.url,
+        download.info.chunks,
+        download.info.size,
+        start_time,
+    ));
 
     for task in downloaders {
         task.await.map_err(|x| error!("{}", x)).unwrap();
@@ -67,7 +84,14 @@ async fn main() -> DResult<()> {
     Ok(())
 }
 
-async fn file_manager(mut rx: Receiver<Chunk>, path: String, url: String, chunks: usize,  size:u64, start_time: Instant) {
+async fn file_manager(
+    mut rx: Receiver<Chunk>,
+    path: String,
+    url: String,
+    chunks: usize,
+    size: u64,
+    start_time: Instant,
+) {
     let file_path = determine_file_path(&path, &url);
 
     debug!("Parsed target file path as:\n {:?}", file_path);
@@ -114,7 +138,7 @@ async fn file_manager(mut rx: Receiver<Chunk>, path: String, url: String, chunks
             println!("Download finished in {:?}", duration);
             break;
         }
-    }    
+    }
 }
 
 #[derive(Debug)]
@@ -147,7 +171,7 @@ impl Status {
         self.chunks.len() == self.total_chunks
     }
     fn check(&self) -> bool {
-        if self.check_len(){
+        if self.check_len() {
             for c in 0..self.total_chunks {
                 if !self.chunks.contains(&c) {
                     return false;
@@ -188,14 +212,15 @@ impl std::fmt::Display for Status {
 const supe: [char; 10] = ['⁰', '¹', '²', '³', '⁴', '⁵', '⁶', '⁷', '⁸', '⁹'];
 fn superscript(mut n: usize) -> String {
     let mut s: String = String::new();
-    if n == 0 { s.push(supe[0]); s }
-    else {
+    if n == 0 {
+        s.push(supe[0]);
+        s
+    } else {
         while n > 0 {
             s.push(supe[n % 10]);
             n = n / 10;
         }
         s.chars().rev().collect()
-
     }
 }
 async fn get_chunk(
@@ -234,4 +259,3 @@ async fn get_chunk(
     .await
     .expect("Failed sending chunk through channel");
 }
-

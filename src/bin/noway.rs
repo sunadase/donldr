@@ -1,7 +1,10 @@
 use std::{borrow::Borrow, path::PathBuf};
 
 use clap::Parser;
-use donldr::{download::{determine_file_path, Download}, DResult, Errors};
+use donldr::{
+    download::{determine_file_path, Download},
+    DResult, Errors,
+};
 use futures::StreamExt;
 use reqwest::Client;
 use tokio::{fs::File, io::AsyncWriteExt, time::Instant};
@@ -48,7 +51,6 @@ async fn main() -> DResult<()> {
     debug!("Parsed target file path as:\n {:?}", file_path);
 
     download_files(&download.url, &file_path).await?;
-
 
     Ok(())
 }

@@ -1,14 +1,23 @@
-use std::{borrow::Borrow, io::{Read, Write}, path::PathBuf, ptr};
+use std::{
+    borrow::Borrow,
+    io::{Read, Write},
+    path::PathBuf,
+    ptr,
+};
 
 use clap::Parser;
-use donldr::{download::{self, determine_file_path, Download}, set_tracing, DResult};
+use donldr::{
+    download::{self, determine_file_path, Download},
+    set_tracing, DResult,
+};
 use reqwest::Client;
 use tokio::{fs::File, task::JoinHandle, time::Instant};
 use tokio_util::bytes::BufMut;
 use tracing::{
-    debug, error, info, subscriber::{self, SetGlobalDefaultError}, warn
+    debug, error, info,
+    subscriber::{self, SetGlobalDefaultError},
+    warn,
 };
-
 
 struct DownloadTask {
     url: String,
@@ -51,7 +60,7 @@ async fn main() -> DResult<()> {
 
     let mut mmap: memmap2::MmapMut =
         unsafe { memmap2::MmapMut::map_mut(&file).expect("getting a mmap for file failed") };
-        
+
     let mut downloaders: Vec<JoinHandle<()>> = vec![];
     let start_time = Instant::now();
     for idx in 0..download.info.chunks {
@@ -59,7 +68,7 @@ async fn main() -> DResult<()> {
         let url = download.url.clone();
         let (from, to) = download.get_ranges(idx as usize);
         debug!("range: [{from}-{to}]");
-        let len = (to-from+1) as usize;
+        let len = (to - from + 1) as usize;
         debug!("len  : {len}");
         let mut chunk = Memory::new(unsafe { mmap.as_mut_ptr().add(from as usize) }, len);
         // let mut chunk = mmap.get_mut(from as usize..=to as usize).expect("Slicing mmap failed");
@@ -84,8 +93,13 @@ async fn main() -> DResult<()> {
                     }
                 }
             };
-            debug!("Finished downloading chunk {}, len:{}, [{from}-{to}]: {}", idx, response.len(), (to-from+1));
-            
+            debug!(
+                "Finished downloading chunk {}, len:{}, [{from}-{to}]: {}",
+                idx,
+                response.len(),
+                (to - from + 1)
+            );
+
             chunk.copy_fill(response.as_ptr(), std::cmp::min(chunk.len, response.len()));
             debug!("Finished writing chunk {}, len:{}", idx, chunk.len);
             // chunk.write_all(response.as_ref());
@@ -97,8 +111,8 @@ async fn main() -> DResult<()> {
     }
     debug!("Mem download finished in {:?}", start_time.elapsed());
     debug!("all tasks finished and returned");
-    
-    let disk_time = Instant::now(); 
+
+    let disk_time = Instant::now();
     mmap.flush()?;
     debug!("mmap flushed, took {:?}", disk_time.elapsed());
     debug!("Total download finished in {:?}", start_time.elapsed());
@@ -126,7 +140,7 @@ async fn main() -> DResult<()> {
     //                 }
     //             }
     //         };
-        
+
     //         chunk.write_all(response.as_ref());
     //     });
     // }
@@ -134,25 +148,28 @@ async fn main() -> DResult<()> {
     Ok(())
 }
 
-
-
 struct Memory {
     inner: *mut u8,
-    len: usize
+    len: usize,
 }
 
 impl Memory {
-    fn new(ptr: *mut u8, len:usize) -> Self {
-        Memory { inner: ptr, len}
+    fn new(ptr: *mut u8, len: usize) -> Self {
+        Memory { inner: ptr, len }
     }
 
     fn copy_fill_from(&mut self, src: *const u8) {
-        unsafe { self.inner.copy_from(src, self.len); }
+        unsafe {
+            self.inner.copy_from(src, self.len);
+        }
     }
 
-    fn copy_fill(&mut self, src: *const u8, len:usize) {
-        assert!(len<= self.len, "Can't give a length larger than allocated memory length");
-        unsafe { self.inner.copy_from(src, len)}
+    fn copy_fill(&mut self, src: *const u8, len: usize) {
+        assert!(
+            len <= self.len,
+            "Can't give a length larger than allocated memory length"
+        );
+        unsafe { self.inner.copy_from(src, len) }
     }
 }
 
