@@ -10,8 +10,13 @@ use donldr::{
     download::{self, determine_file_path, Download},
     set_tracing, DResult,
 };
+use futures::{stream, FutureExt, StreamExt, TryFutureExt};
 use reqwest::Client;
-use tokio::{fs::File, task::JoinHandle, time::Instant};
+use tokio::{
+    fs::File,
+    task::{JoinHandle, JoinSet},
+    time::Instant,
+};
 use tokio_util::bytes::BufMut;
 use tracing::{
     debug, error, info,
@@ -61,8 +66,56 @@ async fn main() -> DResult<()> {
     let mut mmap: memmap2::MmapMut =
         unsafe { memmap2::MmapMut::map_mut(&file).expect("getting a mmap for file failed") };
 
-    let mut downloaders: Vec<JoinHandle<()>> = vec![];
+    // let mut downloaders: Vec<JoinHandle<()>> = vec![];
+    let mut downloaders = JoinSet::new();
+
     let start_time = Instant::now();
+
+    // let stream_of_requests = stream::iter((0..download.info.chunks).map(|idx| {
+    //     let (from, to) = download.get_ranges(idx as usize);
+    //     let req =
+    //     download
+    //         .client
+    //         .get(&download.url)
+    //         .header("Range", format!("bytes={}-{}", from, to))
+    //         .send();
+    //     req
+    //         .then(|x| x.expect("Failed getting request").bytes())
+    //         .map_err(|e| (e, req.))
+    //         .map(move |x| (idx, x))
+    // }));
+    // let mut buffer = stream_of_requests.buffer_unordered(download.info.chunks);
+
+    // let mut map_write = JoinSet::new();
+    // while let Some((idx, response)) = buffer.next().await {
+    //     match response {
+    //         Ok(res) => {
+    //             let (from, to) = download.get_ranges(idx as usize);
+    //             let len = (to - from + 1) as usize;
+    //             let mut chunk =
+    //             Memory::new(unsafe { mmap.as_mut_ptr().add(from as usize) }, len);
+    //             debug!(
+    //                 "Finished downloading chunk {}, len:{}, [{from}-{to}]: {}",
+    //                 idx,
+    //                 res.len(),
+    //                 (to - from + 1)
+    //             );
+    //             map_write.spawn(async move {
+    //                 chunk.copy_fill(res.as_ptr(), std::cmp::min(chunk.len, res.len()));
+    //                 debug!("Finished writing chunk {}, len:{}", idx, chunk.len);
+    //                 idx
+    //             });
+    //         }
+    //         Err((err, req)) => {
+    //                 //Request failed how to retry?
+    //                 error!("Response to bytes failed: {}", err);
+    //                 // Err(idx)
+    //                 // buffer.
+    //         }
+    //     }
+    // }
+    
+
     for idx in 0..download.info.chunks {
         let client = download.client.clone();
         let url = download.url.clone();
@@ -73,7 +126,7 @@ async fn main() -> DResult<()> {
         let mut chunk = Memory::new(unsafe { mmap.as_mut_ptr().add(from as usize) }, len);
         // let mut chunk = mmap.get_mut(from as usize..=to as usize).expect("Slicing mmap failed");
 
-        downloaders.push(tokio::spawn(async move {
+        downloaders.spawn(async move {
             let response = loop {
                 let request = client
                     .get(&url)
@@ -104,11 +157,24 @@ async fn main() -> DResult<()> {
             debug!("Finished writing chunk {}, len:{}", idx, chunk.len);
             // chunk.write_all(response.as_ref());
             drop(chunk);
-        }));
+            idx
+        });
     }
-    for task in downloaders {
-        task.await.map_err(|x| error!("{}", x)).unwrap();
+    let mut seen: Vec<bool> = vec![false; download.info.chunks];
+    while let Some(res) = downloaders.join_next().await {
+        let idx = res.unwrap();
+        seen[idx] = true;
+        let sc = seen.iter().filter(|&x| *x==true).count();
+        let perc = (sc as f32 / download.info.chunks as f32) * 100.;
+        info!("{}/{}, {:>3}%", sc, download.info.chunks, perc)
     }
+    // while let Some(res) = map_write.join_next().await {
+    //     let idx = res.unwrap();
+    //     seen[idx] = true;
+    //     let perc = (seen.iter().count() / download.info.chunks) as f32 * 100.;
+    //     info!("{}/{}, {:>3}%", seen.iter().count(), download.info.chunks, perc)
+    // }
+
     debug!("Mem download finished in {:?}", start_time.elapsed());
     debug!("all tasks finished and returned");
 
@@ -116,34 +182,6 @@ async fn main() -> DResult<()> {
     mmap.flush()?;
     debug!("mmap flushed, took {:?}", disk_time.elapsed());
     debug!("Total download finished in {:?}", start_time.elapsed());
-    // for (idx, chunk) in mmap.chunks_mut(download.info.chunk_size as usize).enumerate() {
-    //     let client = download.client.clone();
-    //     let url = download.url.clone();
-    //     let (from, to) = download.get_ranges(idx);
-    //     tokio::spawn(async move {
-    //         let response = loop {
-    //             let request = client
-    //                 .get(url)
-    //                 .header("Range", format!("bytes={}-{}", from, to));
-    //             match request.send().await {
-    //                 Err(e) => {
-    //                     debug!("Chunk request failed with {}, retrying", e);
-    //                 }
-    //                 Ok(o) => {
-    //                     debug!("Got response: {:?}", o.headers());
-    //                     match o.bytes().await {
-    //                         Ok(b) => break b,
-    //                         Err(e) => {
-    //                             debug!("Failed retrieving bytes from response body? {}", e)
-    //                         }
-    //                     }
-    //                 }
-    //             }
-    //         };
-
-    //         chunk.write_all(response.as_ref());
-    //     });
-    // }
 
     Ok(())
 }
@@ -153,7 +191,7 @@ async fn main() -> DResult<()> {
 ///  it's suppossed to be used with MMAPd memory
 ///  address with a known length. If the length
 ///  provided is not right or ptr is not a valid
-///  memory region with required permissions it 
+///  memory region with required permissions it
 ///  will cause issues.
 struct Memory {
     inner: *mut u8,
@@ -175,7 +213,7 @@ impl Memory {
     /// less than self.len this function will try
     /// to access beyond it's length:
     ///     SIGSEGV ADDRESS BOUNDARY ERROR
-    /// consider using: 
+    /// consider using:
     ///     copy_fill with min(self.len, src.len)
     fn copy_fill_from(&mut self, src: *const u8) {
         unsafe {
