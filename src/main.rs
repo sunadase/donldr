@@ -1,4 +1,4 @@
-use std::{borrow::Borrow, path::PathBuf};
+use std::{borrow::Borrow, io::{Read, Write}, path::PathBuf};
 
 use clap::Parser;
 use donldr::{download::{self, determine_file_path, Download}, set_tracing, DResult};
@@ -38,9 +38,8 @@ async fn main() -> DResult<()> {
     let c = Cli::parse();
     debug!("parsed cli:\n{:#?}", c);
     let download = Download::new(c.url, c.path, c.chunks).await?;
-    drop(c);
 
-    let file_path = determine_file_path(download.path, download.url);
+    let file_path = determine_file_path(&download.path, &download.url);
 
     let file = File::options()
         .read(true)
@@ -52,25 +51,66 @@ async fn main() -> DResult<()> {
 
     file.set_len(download.info.size).await?;
 
-    let mut mmap =
+    let mut mmap: memmap2::MmapMut =
         unsafe { memmap2::MmapMut::map_mut(&file).expect("getting a mmap for file failed") };
-    // tokio::pin!(mmap);
-    mmap.mmap
-        .chunks_mut(chunk_size as usize)
-        .enumerate()
-        .for_each(move |(idx, mem_chunk)| {
-            tokio::spawn(chunk_download_write(
-                client.clone(),
-                idx,
-                mem_chunk,
-                chunk_size.try_into().unwrap(),
-                url.to_string(),
-            ));
-        });
 
-    // for (idx, (from, to)) in ranges.iter().enumerate() {
-    //     let mem_chunk = mmap.range_writer(*from as usize, (to-from+1) as usize).expect("Failed chunking mmap to writer");
-    //     tokio::spawn(chunk_download_write(client.clone(), idx, mem_chunk, (from.to_owned(), to.to_owned()), c.url.to_owned()));
+    for idx in 0..download.info.chunk_size {
+        let client = download.client.clone();
+        let url = download.url.clone();
+        let (from, to) = download.get_ranges(idx as usize);
+        let mut chunk = mmap.get_mut(from as usize..=to as usize).expect("Slicing mmap failed");
+        tokio::spawn(async move {
+            let response = loop {
+                let request = client
+                    .get(url.to_owned())
+                    .header("Range", format!("bytes={}-{}", from, to));
+                match request.send().await {
+                    Err(e) => {
+                        debug!("Chunk request failed with {}, retrying", e);
+                    }
+                    Ok(o) => {
+                        debug!("Got response: {:?}", o.headers());
+                        match o.bytes().await {
+                            Ok(b) => break b,
+                            Err(e) => {
+                                debug!("Failed retrieving bytes from response body? {}", e)
+                            }
+                        }
+                    }
+                }
+            };
+        
+            chunk.write_all(response.as_ref());
+        });
+    }
+
+    // for (idx, chunk) in mmap.chunks_mut(download.info.chunk_size as usize).enumerate() {
+    //     let client = download.client.clone();
+    //     let url = download.url.clone();
+    //     let (from, to) = download.get_ranges(idx);
+    //     tokio::spawn(async move {
+    //         let response = loop {
+    //             let request = client
+    //                 .get(url)
+    //                 .header("Range", format!("bytes={}-{}", from, to));
+    //             match request.send().await {
+    //                 Err(e) => {
+    //                     debug!("Chunk request failed with {}, retrying", e);
+    //                 }
+    //                 Ok(o) => {
+    //                     debug!("Got response: {:?}", o.headers());
+    //                     match o.bytes().await {
+    //                         Ok(b) => break b,
+    //                         Err(e) => {
+    //                             debug!("Failed retrieving bytes from response body? {}", e)
+    //                         }
+    //                     }
+    //                 }
+    //             }
+    //         };
+        
+    //         chunk.write_all(response.as_ref());
+    //     });
     // }
 
     Ok(())
@@ -108,3 +148,11 @@ async fn chunk_download_write(
 
     Ok(())
 }
+
+
+
+
+struct Memory {
+    inner: [u8]
+}
+

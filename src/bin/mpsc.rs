@@ -68,7 +68,7 @@ async fn main() -> DResult<()> {
 }
 
 async fn file_manager(mut rx: Receiver<Chunk>, path: String, url: String, chunks: usize,  size:u64, start_time: Instant) {
-    let file_path = determine_file_path(path, url);
+    let file_path = determine_file_path(&path, &url);
 
     debug!("Parsed target file path as:\n {:?}", file_path);
 
