@@ -24,14 +24,11 @@ cargo run --bin mpsc -- -u https://github.com/wez/wezterm/releases/download/2024
 wget https://github.com/wez/wezterm/releases/download/20240203-110809-5046fc22/wezterm-20240203-110809-5046fc22-src.tar.gz.sha256
 
 sha256sum ./wezterm-20240203-110809-5046fc22-src.tar.gz
-
-
 ```
-missing:
 
-fix noway and compare [1](./notes.md#L56)
--> noway 77s, mspc with 8 chunks 47s
-
+todo:
+- comparisons + avgd cmp
+- >noway 77s, mspc with 8 chunks 47s
 
 mpsc scheme:
 ```
@@ -92,8 +89,8 @@ mmap        v          v          v          v          v
             │  chunk1  │  chunk2  │  chunk3  │  chunk4  │  chunk5 │
             ├──────────┴──────────┴──────────┴──────────┴─────────┘
             │mmap flush to disk
-            v            
-
+            v        
+          (disk)
 ```
 
 
