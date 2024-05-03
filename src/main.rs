@@ -148,22 +148,47 @@ async fn main() -> DResult<()> {
     Ok(())
 }
 
+/// SAFETY:
+///  This type's mutating functions are UNSAFE
+///  it's suppossed to be used with MMAPd memory
+///  address with a known length. If the length
+///  provided is not right or ptr is not a valid
+///  memory region with required permissions it 
+///  will cause issues.
 struct Memory {
     inner: *mut u8,
     len: usize,
 }
 
 impl Memory {
+    ///SAFETY:
+    /// This type assumes it's a mmap memory region
+    /// with required permissions, and a valid len.
     fn new(ptr: *mut u8, len: usize) -> Self {
         Memory { inner: ptr, len }
     }
 
+    ///SAFETY:
+    /// This type assumes it's a mmap memory region
+    /// with required permissions.
+    /// If the src to be copied from has length
+    /// less than self.len this function will try
+    /// to access it will try to access beyond
+    /// src's length: SIGSEGV ADDRESS BOUNDARY ERROR
+    /// consider using: 
+    ///     copy_fill with min(self.len, src.len)
     fn copy_fill_from(&mut self, src: *const u8) {
         unsafe {
             self.inner.copy_from(src, self.len);
         }
     }
 
+    ///SAFETY:
+    /// If the len doesnt go out of bounds for both
+    /// src and self, assuming this types usecase
+    /// as a mmap memory region and src an accessible
+    /// memory address, it should be safe.
+    /// len should be: min(self.len, src.len)
     fn copy_fill(&mut self, src: *const u8, len: usize) {
         assert!(
             len <= self.len,
