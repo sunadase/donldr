@@ -3,10 +3,10 @@ use std::{borrow::Borrow, io::{Read, Write}, path::PathBuf, ptr};
 use clap::Parser;
 use donldr::{download::{self, determine_file_path, Download}, set_tracing, DResult};
 use reqwest::Client;
-use tokio::{fs::File, task::JoinHandle};
+use tokio::{fs::File, task::JoinHandle, time::Instant};
 use tokio_util::bytes::BufMut;
 use tracing::{
-    debug, error, subscriber::{self, SetGlobalDefaultError}, warn
+    debug, error, info, subscriber::{self, SetGlobalDefaultError}, warn
 };
 
 
@@ -53,6 +53,7 @@ async fn main() -> DResult<()> {
         unsafe { memmap2::MmapMut::map_mut(&file).expect("getting a mmap for file failed") };
         
     let mut downloaders: Vec<JoinHandle<()>> = vec![];
+    let start_time = Instant::now();
     for idx in 0..download.info.chunks {
         let client = download.client.clone();
         let url = download.url.clone();
@@ -94,10 +95,13 @@ async fn main() -> DResult<()> {
     for task in downloaders {
         task.await.map_err(|x| error!("{}", x)).unwrap();
     }
+    debug!("Mem download finished in {:?}", start_time.elapsed());
     debug!("all tasks finished and returned");
     
+    let disk_time = Instant::now(); 
     mmap.flush()?;
-    debug!("mmap flushed");
+    debug!("mmap flushed, took {:?}", disk_time.elapsed());
+    debug!("Total download finished in {:?}", start_time.elapsed());
     // for (idx, chunk) in mmap.chunks_mut(download.info.chunk_size as usize).enumerate() {
     //     let client = download.client.clone();
     //     let url = download.url.clone();
