@@ -1,14 +1,12 @@
-use std::{borrow::Borrow, io::{Read, Write}, path::PathBuf};
+use std::{borrow::Borrow, io::{Read, Write}, path::PathBuf, ptr};
 
 use clap::Parser;
 use donldr::{download::{self, determine_file_path, Download}, set_tracing, DResult};
 use reqwest::Client;
-use tokio::fs::File;
+use tokio::{fs::File, task::JoinHandle};
 use tokio_util::bytes::BufMut;
 use tracing::{
-    debug,
-    subscriber::{self, SetGlobalDefaultError},
-    warn,
+    debug, error, subscriber::{self, SetGlobalDefaultError}, warn
 };
 
 
@@ -53,16 +51,22 @@ async fn main() -> DResult<()> {
 
     let mut mmap: memmap2::MmapMut =
         unsafe { memmap2::MmapMut::map_mut(&file).expect("getting a mmap for file failed") };
-
-    for idx in 0..download.info.chunk_size {
+        
+    let mut downloaders: Vec<JoinHandle<()>> = vec![];
+    for idx in 0..download.info.chunks {
         let client = download.client.clone();
         let url = download.url.clone();
         let (from, to) = download.get_ranges(idx as usize);
-        let mut chunk = mmap.get_mut(from as usize..=to as usize).expect("Slicing mmap failed");
-        tokio::spawn(async move {
+        debug!("range: [{from}-{to}]");
+        let len = (to-from+1) as usize;
+        debug!("len  : {len}");
+        let mut chunk = Memory::new(unsafe { mmap.as_mut_ptr().add(from as usize) }, len);
+        // let mut chunk = mmap.get_mut(from as usize..=to as usize).expect("Slicing mmap failed");
+
+        downloaders.push(tokio::spawn(async move {
             let response = loop {
                 let request = client
-                    .get(url.to_owned())
+                    .get(&url)
                     .header("Range", format!("bytes={}-{}", from, to));
                 match request.send().await {
                     Err(e) => {
@@ -79,11 +83,21 @@ async fn main() -> DResult<()> {
                     }
                 }
             };
-        
-            chunk.write_all(response.as_ref());
-        });
+            debug!("Finished downloading chunk {}, len:{}", idx, response.len());
+            
+            chunk.copy_fill_from(response.as_ptr());
+            debug!("Finished writing chunk {}, len:{}", idx, chunk.len);
+            // chunk.write_all(response.as_ref());
+            drop(chunk);
+        }));
     }
-
+    for task in downloaders {
+        task.await.map_err(|x| error!("{}", x)).unwrap();
+    }
+    debug!("all tasks finished and returned");
+    
+    mmap.flush()?;
+    debug!("mmap flushed");
     // for (idx, chunk) in mmap.chunks_mut(download.info.chunk_size as usize).enumerate() {
     //     let client = download.client.clone();
     //     let url = download.url.clone();
@@ -116,43 +130,22 @@ async fn main() -> DResult<()> {
     Ok(())
 }
 
-async fn chunk_download_write(
-    client: Client,
-    idx: usize,
-    mem_chunk: &mut [u8],
-    chunk_size: usize,
-    url: String,
-) -> DResult<()> {
-    // are chunks mut and manual ranges matching? probably not
-
-    //idx*chunk_size, idx*chunk_size+chunk_size
-
-    let (from, to) = (idx * chunk_size, idx * chunk_size + chunk_size);
-
-    let chunk = client
-        .get(url)
-        .header("Range", format!("bytes={}-{}", from, to))
-        .send()
-        .await?
-        .error_for_status()?;
-
-    debug!("chunk {} - {:?}:\n{:?}", idx, chunk_size, &chunk);
-
-    // let download_stream = chunk.bytes_stream()
-    // .map_err(|e| futures::io::Error::new(futures::io::ErrorKind::Other, e))
-    // .into_async_read();
-
-    // let download_stream = download_stream.compat();
-
-    // tokio::io::copy(&mut download_stream, &mut mem_chunk)
-
-    Ok(())
-}
-
-
 
 
 struct Memory {
-    inner: [u8]
+    inner: *mut u8,
+    len: usize
 }
 
+impl Memory {
+    fn new(ptr: *mut u8, len:usize) -> Self {
+        Memory { inner: ptr, len}
+    }
+
+    fn copy_fill_from(&mut self, src: *const u8) {
+        unsafe { self.inner.copy_from(src, self.len); }
+    }
+}
+
+unsafe impl Send for Memory {}
+unsafe impl Sync for Memory {}
