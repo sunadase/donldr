@@ -1,19 +1,22 @@
 use std::{
     borrow::Borrow,
+    fmt::write,
     io::{Read, Write},
-    path::PathBuf,
-    ptr, sync::atomic::AtomicUsize,
+    path::{Display, PathBuf},
+    ptr,
+    sync::atomic::AtomicUsize,
 };
 
 use clap::Parser;
 use donldr::{
     download::{self, determine_file_path, Download},
-    set_tracing, DResult,
+    set_tracing, DResult, Errors,
 };
 use futures::{stream, FutureExt, StreamExt, TryFutureExt};
 use reqwest::{Client, Error};
 use tokio::{
     fs::File,
+    sync::mpsc::{self, Sender},
     task::{JoinHandle, JoinSet},
     time::Instant,
 };
@@ -23,6 +26,7 @@ use tracing::{
     subscriber::{self, SetGlobalDefaultError},
     warn,
 };
+use tracing_subscriber::fmt::format;
 
 struct DownloadTask {
     url: String,
@@ -67,19 +71,18 @@ async fn main() -> DResult<()> {
         unsafe { memmap2::MmapMut::map_mut(&file).expect("getting a mmap for file failed") };
 
     // let mut downloaders: Vec<JoinHandle<()>> = vec![];
-    let mut downloaders: JoinSet<Result<usize, Error>> = JoinSet::new();
+    let mut downloaders: JoinSet<Result<usize, Errors>> = JoinSet::new();
+    let (progress_tx, mut progress_rx) = mpsc::channel(download.info.chunks * 2);
 
     let start_time = Instant::now();
     let stream_of_requests = stream::iter((0..download.info.chunks).map(|idx| {
         let (from, to) = download.get_ranges(idx as usize);
-        let req =
-        download
+        let req = download
             .client
             .get(&download.url)
             .header("Range", format!("bytes={}-{}", from, to))
             .send();
-        req
-            .map(move |x| (idx, x))
+        req.map(move |x| (idx, x))
     }));
     let mut buffer = stream_of_requests.buffer_unordered(download.info.chunks);
 
@@ -88,40 +91,65 @@ async fn main() -> DResult<()> {
             Ok(res) => {
                 let (from, to) = download.get_ranges(idx as usize);
                 let len = (to - from + 1) as usize;
-                let mut chunk =
-                Memory::new(unsafe { mmap.as_mut_ptr().add(from as usize) }, len);
+                let mut chunk = Memory::new(unsafe { mmap.as_mut_ptr().add(from as usize) }, len);
                 let mut stream = res.bytes_stream();
+                let p_tx = progress_tx.clone();
                 downloaders.spawn(async move {
                     let mut written = 0;
                     while let Some(chunk_result) = stream.next().await {
                         let respchunk = chunk_result?;
-                        
-                        debug!("strmd chunk size: {}", respchunk.len());
-                        chunk.write_at(written, respchunk.as_ptr(), std::cmp::min(respchunk.len(), chunk.len-written));
+                        chunk.write_at(
+                            written,
+                            respchunk.as_ptr(),
+                            std::cmp::min(respchunk.len(), chunk.len - written),
+                        );
                         written += respchunk.len();
-                        let perc = written as f32 / len as f32;
+                        // let perc = written as f32 / len as f32;
                         // debug!("{}/{} : {:>3}",written, len, perc);
-
+                        p_tx.send((idx, respchunk.len(), len))
+                            .await
+                            .map_err(|e| Errors::Custom(format!("{:?}", e)))?;
                     }
                     Ok(idx)
                 });
             }
             Err((err)) => {
-                    //Request failed how to retry?
-                    error!("Send failed: {}", err);
-                    // Err(idx)
-                    // buffer.
+                //Request failed how to retry?
+                error!("Send failed: {}", err);
+                // Err(idx)
+                // buffer.
             }
         }
     }
 
-    let mut seen = vec![false; download.info.chunks];
+    let lens = download
+        .info
+        .ranges
+        .iter()
+        .map(|(from, to)| (to - from + 1) as usize)
+        .collect();
+    debug!("lens   {:?}", lens);
+    let mut stats = Status::new(lens);
+    debug!("stats: {:?}", stats);
+    //TODO: indicatif
+    tokio::spawn(async move {
+        let mut write_checkp = 0;
+        let mut total_written = 0;
+        while let Some((idx, written, len)) = progress_rx.recv().await {
+            stats.add_to(idx, written);
+            total_written += written;
+            // debug!("[{:2}]: {} of {}", idx, written, len);
+            if ((total_written - write_checkp) as f32 / download.info.size as f32) * 100. > 1. {
+                write_checkp = total_written;
+                info!("\n{}", stats);
+            }
+        }
+        debug!("Progress loop ended");
+    });
+
     while let Some(Ok(res)) = downloaders.join_next().await {
         let idx = res.unwrap();
-        seen[idx] = true;
-        let sc = seen.iter().filter(|&x| *x==true).count();
-        let perc = (sc as f32 / download.info.chunks as f32) * 100.;
-        info!("{}/{}, {:>3}%", sc, download.info.chunks, perc)
+        info!("done {}", idx);
     }
 
     debug!("Mem download finished in {:?}", start_time.elapsed());
@@ -153,7 +181,11 @@ impl Memory {
     /// This type assumes it's a mmap memory region
     /// with required permissions, and a valid len.
     fn new(ptr: *mut u8, len: usize) -> Self {
-        Memory { inner: ptr, len , cursor: 0}
+        Memory {
+            inner: ptr,
+            len,
+            cursor: 0,
+        }
     }
 
     ///SAFETY:
@@ -184,16 +216,85 @@ impl Memory {
         );
         unsafe { self.inner.copy_from(src, len) }
     }
-    
 
-    fn write_at(&mut self, offset: usize, src:*const u8, len: usize) {
+    fn write_at(&mut self, offset: usize, src: *const u8, len: usize) {
         assert!(
-            offset+len <= self.len,
+            offset + len <= self.len,
             "Writes out of bounds, offset+len can't be larger than self.len"
         );
-        unsafe { self.inner.add(offset).copy_from(src, len)}
+        unsafe { self.inner.add(offset).copy_from(src, len) }
     }
 }
 
 unsafe impl Send for Memory {}
 unsafe impl Sync for Memory {}
+
+#[derive(Debug)]
+struct Status {
+    progs: Vec<Progress>,
+}
+impl Status {
+    /// total size list must be index ordered
+    fn new(total_size_list: Vec<usize>) -> Self {
+        Status {
+            progs: total_size_list
+                .iter()
+                .map(|chunk_sz| Progress::new(0, *chunk_sz))
+                .collect(),
+        }
+    }
+
+    fn add_to(&mut self, idx: usize, written: usize) {
+        assert!(idx < self.progs.len(), "Indexing beyond existing progs?");
+        self.progs.get_mut(idx).unwrap().add_prog(written);
+    }
+
+    fn get_total_written(&self) -> usize {
+        self.progs.iter().fold(0, |a, b| a + b.current)
+    }
+}
+
+impl std::fmt::Display for Status {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[")?;
+        for pg in 0..self.progs.len() - 1 {
+            write!(f, "{:^4}|", pg)?;
+        }
+        write!(f, "|{:^4}]\n", self.progs.len() - 1)?;
+        write!(f, "[")?;
+        for pg in 0..self.progs.len() - 1 {
+            write!(
+                f,
+                "{:^4}%|",
+                self.progs.get(pg).unwrap().percentage() * 100.
+            )?;
+        }
+        write!(
+            f,
+            "|{:^4}%]",
+            self.progs.last().unwrap().percentage() * 100.
+        )
+    }
+}
+
+#[derive(Debug)]
+struct Progress {
+    current: usize,
+    total: usize,
+}
+
+impl Progress {
+    fn new(current: usize, total: usize) -> Self {
+        Progress { current, total }
+    }
+    fn percentage(&self) -> f32 {
+        self.current as f32 / self.total as f32
+    }
+    fn add_prog(&mut self, written: usize) {
+        if self.current + written > self.total {
+            // error!("Progress overflow?, got more chunks than expected?: {}/{} wanted to write {} more -> !{}<={}", self.current, self.total, written, written+self.current, self.total);
+        }
+        // assert!(written+self.current <= self.total, "Progress overflow?, got more chunks than expected");
+        self.current += written
+    }
+}
